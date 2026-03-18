@@ -1,0 +1,11 @@
+python build_ivn_graphs.py \
+  --input_dir ./data/2017-subaru-forester/preprocessed_v3 \
+  --output_dir ./data/2017-subaru-forester/graphs_sequences_small \
+  --graphs_per_shard 2000 \
+  --temporal_k 1 \
+  --same_id_k 1 \
+  --payload_topk 1 \
+  --timing_topk 1 \
+  --subsample_mode keep_all_attacks_downsample_normal \
+  --subsample_frac 0.2 \
+  --subsample_min_per_class 200

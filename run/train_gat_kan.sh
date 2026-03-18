@@ -1,0 +1,19 @@
+python train_gat_kan.py \
+  --graph_folder ./data/2017-subaru-forester/graphs_v1_small \
+  --save_folder ./save/graph_attention_kan_v2 \
+  --model_name graph_attention_kan_v2 \
+  --batch_size 64 \
+  --num_workers 4 \
+  --epochs 100 \
+  --learning_rate 1e-3 \
+  --weight_decay 1e-4 \
+  --hidden_dim 128 \
+  --num_layers 3 \
+  --heads 4 \
+  --id_emb_dim 32 \
+  --rel_emb_dim 8 \
+  --dropout 0.2 \
+  --kan_hidden 128 \
+  --loss_name ce \
+  --use_class_weights \
+  --device cuda > ./save/log/train_gat_kan_no_amp.log 2>&1 &

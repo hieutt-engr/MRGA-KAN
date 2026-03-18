@@ -1,0 +1,15 @@
+python train_graph_temporal_kan_test.py \
+  --sequence_folder ./data/2017-subaru-forester/seq_temporal_clean \
+  --save_folder ./save/graph_sequence_last_kan_scratch \
+  --model_name graph_sequence_last_kan_scratch \
+  --sequence_model_mode last_only \
+  --batch_size 64 \
+  --num_workers 8 \
+  --epochs 100 \
+  --learning_rate 1e-3 \
+  --weight_decay 1e-4 \
+  --freeze_graph_encoder_epochs 0 \
+  --subsample_train_frac 0.2 \
+  --subsample_val_frac 0.2 \
+  --subsample_test_frac 0.2 \
+  --device cuda > ./save/log/train_graph_temporal_kan_20%_no_trans.log 2>&1 &

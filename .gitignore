@@ -1,0 +1,9 @@
+
+data/
+figures/
+save/
+
+__pycache__/
+*.pyc
+*.pyo
+.vscode/

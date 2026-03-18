@@ -1,0 +1,21 @@
+python train_graph_temporal_kan_v3.py \
+  --sequence_folder ./data/2017-subaru-forester/seq_temporal_majority \
+  --save_folder ./save/graph_temporal_kan_v4_auxattn_temporal_majority \
+  --model_name graph_temporal_kan_v4_auxattn_temporal_majority \
+  --batch_size 64 \
+  --num_workers 8 \
+  --epochs 100 \
+  --learning_rate 1e-3 \
+  --weight_decay 1e-4 \
+  --freeze_graph_encoder_epochs 0 \
+  --subsample_train_frac 0.2 \
+  --subsample_val_frac 0.2 \
+  --subsample_test_frac 0.2 \
+  --sequence_model_mode transformer \
+  --use_cls_token \
+  --aux_last_loss_weight 0.2 \
+  --attention_log_classes 4,6 \
+  --attention_log_max_sequences 2 \
+  --attention_log_split val \
+  --device cuda \
+  > ./save/log/train_graph_temporal_kan_v4_auxattn_temporal_majority.log 2>&1 &
