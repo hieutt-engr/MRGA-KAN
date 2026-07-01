@@ -1,4 +1,3 @@
-from networks.efficient_kan import KAN
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,17 +6,38 @@ from torch_geometric.nn import GATv2Conv, global_mean_pool, global_max_pool
 
 
 # ============================================================
-# Multi-relation GAT block
+# Standard MLP FeedForward
 # ============================================================
+class MLPFeedForward(nn.Module):
+    """
+    Standard FFN:
+        Linear -> SiLU -> Dropout -> Linear
+    """
+    def __init__(self, in_dim, hidden_dim, out_dim, dropout=0.2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, x, update_grid=False):
+        return self.net(x)
+
+    def regularization_loss(self, regularize_activation=1.0, regularize_entropy=1.0):
+        device = next(self.parameters()).device
+        return torch.tensor(0.0, device=device)
+
 
 # ============================================================
-# Multi-relation GAT block
+# Multi-relation GAT block (MLP FFN)
 # ============================================================
-
 class MultiRelationGATBlock(nn.Module):
     """
     One block for multi-relational graph attention.
     Each relation has its own GATv2Conv, then fused by learnable gates.
+    FFN uses standard MLP.
     """
 
     def __init__(
@@ -29,8 +49,9 @@ class MultiRelationGATBlock(nn.Module):
         rel_emb_dim=8,
         dropout=0.2,
         ffn_ratio=2.0,
+        **kwargs,
     ):
-        super(MultiRelationGATBlock, self).__init__()
+        super().__init__()
 
         self.hidden_dim = hidden_dim
         self.edge_attr_dim = edge_attr_dim
@@ -62,14 +83,14 @@ class MultiRelationGATBlock(nn.Module):
         self.drop = nn.Dropout(dropout)
 
         ffn_hidden = int(hidden_dim * ffn_ratio)
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, ffn_hidden),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_hidden, hidden_dim),
+        self.ffn = MLPFeedForward(
+            in_dim=hidden_dim,
+            hidden_dim=ffn_hidden,
+            out_dim=hidden_dim,
+            dropout=dropout,
         )
 
-    def forward(self, h, edge_index, edge_attr, edge_type):
+    def forward(self, h, edge_index, edge_attr, edge_type, update_grid=False):
         device = h.device
         relation_outputs = []
         active_relations = []
@@ -101,19 +122,29 @@ class MultiRelationGATBlock(nn.Module):
                 h_msg = h_msg + w * h_r
 
         h = self.norm1(h + self.drop(h_msg))
-        h_ffn = self.ffn(h)
+        h_ffn = self.ffn(h, update_grid=update_grid)
         h = self.norm2(h + self.drop(h_ffn))
         return h
 
+    def kan_regularization_loss(self, regularize_activation=1.0, regularize_entropy=1.0):
+        return self.ffn.regularization_loss(
+            regularize_activation=regularize_activation,
+            regularize_entropy=regularize_entropy,
+        )
+
 
 # ============================================================
-# GraphAttentionKAN
+# GraphAttentionMLPHead (multitask, early node head)
 # ============================================================
-
 class GraphAttentionKAN(nn.Module):
     """
-    Multi-relation Graph Attention Encoder + KAN Head
-    for graph-level classification.
+    Multi-relation Graph Attention Encoder + MLP graph head
+    with optional node-classification head for multitask learning.
+
+    Variant:
+    - no KAN FFN in backbone
+    - no KAN graph head
+    - keep MLP node head
     """
 
     def __init__(
@@ -122,6 +153,7 @@ class GraphAttentionKAN(nn.Module):
         edge_attr_dim,
         num_classes,
         num_ids,
+        num_node_classes=None,
         hidden_dim=128,
         num_layers=3,
         heads=4,
@@ -130,6 +162,13 @@ class GraphAttentionKAN(nn.Module):
         num_relations=4,
         dropout=0.2,
         ffn_ratio=2.0,
+        node_head_from_layer=None,
+        # ignored KAN params kept for interface compatibility
+        block_kan_grid_size=5,
+        block_kan_spline_order=3,
+        block_kan_scale_noise=0.1,
+        block_kan_scale_base=1.0,
+        block_kan_scale_spline=1.0,
         kan_hidden=128,
         kan_grid_size=5,
         kan_spline_order=3,
@@ -137,16 +176,30 @@ class GraphAttentionKAN(nn.Module):
         kan_scale_base=1.0,
         kan_scale_spline=1.0,
     ):
-        super(GraphAttentionKAN, self).__init__()
+        super().__init__()
 
         self.node_feat_dim = node_feat_dim
         self.edge_attr_dim = edge_attr_dim
         self.num_classes = num_classes
+        self.num_node_classes = num_node_classes
         self.num_ids = num_ids
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.num_relations = num_relations
         self.dropout = dropout
+
+        if node_head_from_layer is None:
+            if num_layers <= 1:
+                node_head_from_layer = 0
+            else:
+                node_head_from_layer = num_layers - 2
+        if node_head_from_layer < 0:
+            node_head_from_layer = num_layers + node_head_from_layer
+        if not (0 <= node_head_from_layer < num_layers):
+            raise ValueError(
+                f"node_head_from_layer must be in [0, {num_layers - 1}], got {node_head_from_layer}"
+            )
+        self.node_head_from_layer = node_head_from_layer
 
         self.id_embedding = nn.Embedding(num_ids + 1, id_emb_dim)
 
@@ -171,19 +224,26 @@ class GraphAttentionKAN(nn.Module):
 
         self.readout_norm = nn.LayerNorm(hidden_dim * 2)
 
-        self.head = KAN(
-            layers_hidden=[hidden_dim * 2, kan_hidden, num_classes],
-            grid_size=kan_grid_size,
-            spline_order=kan_spline_order,
-            scale_noise=kan_scale_noise,
-            scale_base=kan_scale_base,
-            scale_spline=kan_scale_spline,
-            base_activation=torch.nn.SiLU,
-            grid_eps=0.02,
-            grid_range=(-1, 1),
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Linear(hidden_dim * 2, kan_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(kan_hidden, num_classes),
         )
 
-    def encode_nodes(self, data):
+        if num_node_classes is not None and num_node_classes > 0:
+            self.node_head = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, num_node_classes),
+            )
+        else:
+            self.node_head = None
+
+    def encode_nodes(self, data, update_grid=False, return_all_hidden=False):
         x = data.x
         if hasattr(data, "id_token"):
             id_token = data.id_token
@@ -196,14 +256,19 @@ class GraphAttentionKAN(nn.Module):
         h = torch.cat([x, id_emb], dim=-1)
         h = self.input_proj(h)
 
+        hidden_states = []
         for block in self.blocks:
             h = block(
                 h=h,
                 edge_index=data.edge_index,
                 edge_attr=data.edge_attr,
                 edge_type=data.edge_type,
+                update_grid=update_grid,
             )
+            hidden_states.append(h)
 
+        if return_all_hidden:
+            return h, hidden_states
         return h
 
     def readout(self, h, batch):
@@ -213,53 +278,105 @@ class GraphAttentionKAN(nn.Module):
         g = self.readout_norm(g)
         return g
 
-    def forward(self, data, update_grid=False, return_graph_embedding=False):
+    def classify_nodes(self, h_node):
+        if self.node_head is None:
+            return None
+        return self.node_head(h_node)
+
+    def classify_graph(self, g, update_grid=False):
+        return self.head(g)
+
+    def forward(
+        self,
+        data,
+        update_grid=False,
+        return_graph_embedding=False,
+        return_node_logits=False,
+    ):
         if hasattr(data, "batch"):
             batch = data.batch
         else:
             batch = torch.zeros(data.x.size(0), dtype=torch.long, device=data.x.device)
 
-        h = self.encode_nodes(data)
-        g = self.readout(h, batch)
-        logits = self.head(g, update_grid=update_grid)
+        h_final, hidden_states = self.encode_nodes(
+            data,
+            update_grid=update_grid,
+            return_all_hidden=True,
+        )
 
+        g = self.readout(h_final, batch)
+        graph_logits = self.classify_graph(g, update_grid=update_grid)
+
+        h_node = hidden_states[self.node_head_from_layer]
+        node_logits = self.classify_nodes(h_node) if (return_node_logits or self.node_head is not None) else None
+
+        if return_graph_embedding and return_node_logits:
+            return {
+                "graph_logits": graph_logits,
+                "node_logits": node_logits,
+                "graph_embedding": g,
+                "node_embedding": h_node,
+                "graph_backbone_embedding": h_final,
+            }
         if return_graph_embedding:
-            return logits, g
-        return logits
+            return graph_logits, g
+        if return_node_logits:
+            return {
+                "graph_logits": graph_logits,
+                "node_logits": node_logits,
+            }
+        return graph_logits
 
     def kan_regularization_loss(self, regularize_activation=1.0, regularize_entropy=1.0):
-        return self.head.regularization_loss(
-            regularize_activation=regularize_activation,
-            regularize_entropy=regularize_entropy,
-        )
+        device = next(self.parameters()).device
+        return torch.tensor(0.0, device=device)
 
     def compute_loss(
         self,
-        logits,
+        graph_logits,
         y,
         class_weights=None,
         label_smoothing=0.0,
         kan_reg_lambda=1e-4,
         reg_activation=1.0,
         reg_entropy=1.0,
+        node_logits=None,
+        node_y=None,
+        node_mask=None,
+        node_loss_weight=1.0,
+        node_class_weights=None,
     ):
-        ce = F.cross_entropy(
-            logits,
+        graph_ce = F.cross_entropy(
+            graph_logits,
             y,
             weight=class_weights,
             label_smoothing=label_smoothing,
         )
+
+        node_ce = torch.tensor(0.0, device=graph_logits.device)
+        if node_logits is not None and node_y is not None:
+            if node_mask is None:
+                valid = torch.ones_like(node_y, dtype=torch.bool)
+            else:
+                valid = node_mask.bool()
+            if valid.any():
+                node_ce = F.cross_entropy(
+                    node_logits[valid],
+                    node_y[valid],
+                    weight=node_class_weights,
+                )
 
         kan_reg = self.kan_regularization_loss(
             regularize_activation=reg_activation,
             regularize_entropy=reg_entropy,
         )
 
-        loss = ce + kan_reg_lambda * kan_reg
+        loss = graph_ce + node_loss_weight * node_ce + kan_reg_lambda * kan_reg
 
         stats = {
             "loss": float(loss.detach().cpu()),
-            "ce": float(ce.detach().cpu()),
+            "graph_ce": float(graph_ce.detach().cpu()),
+            "node_ce": float(node_ce.detach().cpu()),
             "kan_reg": float(kan_reg.detach().cpu()),
         }
         return loss, stats

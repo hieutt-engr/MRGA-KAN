@@ -38,9 +38,10 @@ except Exception:
     PolyFocalLoss = None
 
 # ============================================================
-# Your model (must support multitask outputs)
+# Your model
 # ============================================================
-from networks.graph_attention_ffn_kan_multitask import GraphAttentionKAN
+from networks.graph_attention_ffn_kan_multitask_updated import GraphAttentionKAN
+from utils import get_class_names, format_confusion_matrix_df, save_confusion_matrix_artifacts
 
 
 # ============================================================
@@ -72,10 +73,18 @@ def parse_option():
     parser.add_argument("--weight_decay", type=float, default=0.0001)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--print_freq", type=int, default=50)
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="Training device. Use 'cpu', 'cuda', or explicit 'cuda:N'.")
+    parser.add_argument("--gpu_id", type=int, default=0,
+                        help="GPU index used when --device cuda is selected.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--resume", type=str, default="", help="Path to checkpoint to resume")
+    parser.add_argument("--print_val_node_cm_every", type=int, default=1,
+                        help="Print val node confusion matrix every N epochs (0 to disable).")
+    parser.add_argument("--save_val_node_cm", action="store_true",
+                        help="Save val node confusion matrix per epoch to CSV/TXT.")
+
 
     # Scheduler
     parser.add_argument("--scheduler", type=str, default="cosine_restart",
@@ -100,9 +109,13 @@ def parse_option():
     parser.add_argument("--node_target", type=str, default="node_y",
                         choices=["node_y", "node_is_attack"],
                         help="Which node label to use for node task")
-    parser.add_argument("--node_head_from_layer", type=int, default=1,
-                        choices=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
-                        help="Which layer to use for node classification head")
+    parser.add_argument("--node_head_from_layer", type=int, default=-2,
+                        help="Which encoder block output to use for node head. Negative values are allowed, e.g. -1=last block, -2=one block before last")
+    parser.add_argument("--save_epoch_checkpoints", action="store_true",
+                        help="If set, save a checkpoint after each epoch under save_folder/epoch_save")
+    parser.add_argument("--epoch_save_every", type=int, default=1,
+                        help="Save one epoch checkpoint every N epochs when --save_epoch_checkpoints is enabled")
+
     # Loss (graph)
     parser.add_argument("--loss_name", type=str, default="ce",
                         choices=["ce", "focal", "ldam", "polyfocal"])
@@ -149,7 +162,8 @@ def parse_option():
     opt = parser.parse_args()
 
     os.makedirs(opt.save_folder, exist_ok=True)
-    os.makedirs(os.path.join(opt.save_folder, "epoch_save"), exist_ok=True)
+    if opt.save_epoch_checkpoints:
+        os.makedirs(os.path.join(opt.save_folder, "epoch_save"), exist_ok=True)
     return opt
 
 
@@ -185,6 +199,22 @@ def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def cm_df_to_aligned_string(cm_df: pd.DataFrame, index_label: str = "true\pred", min_col_width: int = 12) -> str:
+    """Render a confusion matrix DataFrame with evenly spaced columns for clean terminal logs."""
+    values = cm_df.values
+    value_width = max(len(str(int(v))) for v in values.flatten()) if values.size > 0 else 1
+    label_width = max([len(str(c)) for c in cm_df.columns] + [len(str(i)) for i in cm_df.index] + [len(index_label)])
+    cell_w = max(min_col_width, value_width + 2, label_width + 2)
+    row_label_w = max(len(index_label), max(len(str(i)) for i in cm_df.index)) + 2
+
+    header = " " * row_label_w + "".join(f"{str(col):^{cell_w}}" for col in cm_df.columns)
+    lines = [header]
+    for idx, row in cm_df.iterrows():
+        row_str = f"{str(idx):<{row_label_w}}" + "".join(f"{int(v):^{cell_w}d}" for v in row.values)
+        lines.append(row_str)
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -348,7 +378,7 @@ def build_criterion(loss_name: str, label_smoothing: float, focal_gamma: float,
             return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
         logger.info(f"Using {prefix}PolyFocalLoss")
         try:
-            return PolyFocalLoss(gamma=focal_gamma)
+            return PolyFocalLoss(gamma=focal_gamma, num_classes=10)
         except TypeError:
             return PolyFocalLoss()
 
@@ -694,6 +724,11 @@ def main():
     log_file = os.path.join(opt.save_folder, "training_log.txt")
     logger = set_logger(log_file)
     epoch_save_dir = os.path.join(opt.save_folder, "epoch_save")
+    val_node_cm_dir = os.path.join(opt.save_folder, "val_node_cm")
+    final_reports_dir = os.path.join(opt.save_folder, "reports")
+    if opt.save_val_node_cm:
+        os.makedirs(val_node_cm_dir, exist_ok=True)
+    os.makedirs(final_reports_dir, exist_ok=True)
 
     logger.info("=" * 80)
     logger.info("Start training multitask GraphAttentionKAN with KAN-FFN backbone")
@@ -702,11 +737,18 @@ def main():
 
     set_seed(opt.seed)
 
-    if torch.cuda.is_available() and opt.device != "cpu":
-        logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
-    else:
+    requested_device = str(opt.device).lower().strip()
+    if requested_device == "cpu" or not torch.cuda.is_available():
         opt.device = "cpu"
         logger.info("Using CPU")
+    else:
+        if requested_device == "cuda":
+            opt.device = f"cuda:{opt.gpu_id}"
+        else:
+            # explicit device string like cuda:2 takes precedence
+            opt.device = str(opt.device)
+        gpu_index = int(str(opt.device).split(":")[1]) if ":" in str(opt.device) else 0
+        logger.info(f"Using GPU {gpu_index}: {torch.cuda.get_device_name(gpu_index)}")
 
     graph_folder = Path(opt.graph_folder)
 
@@ -742,6 +784,9 @@ def main():
         num_node_classes = num_graph_classes
         node_label_mapping = label_mapping.copy()
 
+    graph_class_names = get_class_names(label_mapping, num_graph_classes)
+    node_class_names = get_class_names(node_label_mapping, num_node_classes)
+
     logger.info(f"node_feat_dim     = {node_feat_dim}")
     logger.info(f"edge_attr_dim     = {edge_attr_dim}")
     logger.info(f"num_ids           = {num_ids}")
@@ -750,8 +795,8 @@ def main():
 
     graph_cls_num_list = get_graph_class_counts(train_dataset, num_graph_classes)
     node_cls_num_list = get_node_class_counts(train_dataset, num_node_classes, node_target=opt.node_target)
-    logger.info(f"Train graph class distribution: {dict(zip(label_names, graph_cls_num_list))}")
-    logger.info(f"Train node class distribution : {dict(zip([node_label_mapping[i] for i in range(num_node_classes)], node_cls_num_list))}")
+    logger.info(f"Train graph class distribution: {dict(zip(graph_class_names, graph_cls_num_list))}")
+    logger.info(f"Train node class distribution : {dict(zip(node_class_names, node_cls_num_list))}")
 
     train_sampler = None
     if opt.use_weighted_sampler:
@@ -794,7 +839,6 @@ def main():
             edge_attr_dim=edge_attr_dim,
             num_classes=num_graph_classes,
             num_node_classes=num_node_classes,
-            node_head_from_layer=opt.node_head_from_layer,
             num_ids=num_ids,
             hidden_dim=opt.hidden_dim,
             num_layers=opt.num_layers,
@@ -815,6 +859,7 @@ def main():
             kan_scale_noise=opt.kan_scale_noise,
             kan_scale_base=opt.kan_scale_base,
             kan_scale_spline=opt.kan_scale_spline,
+            node_head_from_layer=opt.node_head_from_layer,
         ).to(opt.device)
     except TypeError as e:
         raise RuntimeError(
@@ -878,9 +923,11 @@ def main():
     # Resume
     start_epoch = 1
     best_val_selection = -1.0
-    best_val_graph_macro_f1 = -1.0
-    best_val_node_macro_f1 = -1.0
     best_test_selection = -1.0
+    best_val_graph_macro_f1 = -1.0
+    best_test_graph_macro_f1 = -1.0
+    best_val_node_macro_f1 = -1.0
+    best_test_node_macro_f1 = -1.0
     history = []
 
     if opt.resume:
@@ -893,9 +940,11 @@ def main():
             scaler.load_state_dict(ckpt["scaler"])
         start_epoch = ckpt.get("epoch", 0) + 1
         best_val_selection = ckpt.get("best_val_selection", -1.0)
-        best_val_graph_macro_f1 = ckpt.get("best_val_graph_macro_f1", -1.0)
-        best_val_node_macro_f1 = ckpt.get("best_val_node_macro_f1", -1.0)
         best_test_selection = ckpt.get("best_test_selection", -1.0)
+        best_val_graph_macro_f1 = ckpt.get("best_val_graph_macro_f1", -1.0)
+        best_test_graph_macro_f1 = ckpt.get("best_test_graph_macro_f1", -1.0)
+        best_val_node_macro_f1 = ckpt.get("best_val_node_macro_f1", -1.0)
+        best_test_node_macro_f1 = ckpt.get("best_test_node_macro_f1", -1.0)
         history = ckpt.get("history", [])
         logger.info(f"Resumed from {opt.resume}, start_epoch={start_epoch}")
 
@@ -967,7 +1016,23 @@ def main():
         )
 
         val_graph_cm = confusion_matrix(y_val_true, y_val_pred, labels=list(range(num_graph_classes)))
-        logger.info(f"Val graph confusion matrix:\n{val_graph_cm}")
+        val_graph_cm_df = format_confusion_matrix_df(val_graph_cm, graph_class_names)
+        logger.info("Val Graph Confusion Matrix:\n%s", val_graph_cm_df.to_string())
+
+        if opt.enable_node_task and len(node_val_true) > 0:
+            val_node_cm = confusion_matrix(node_val_true, node_val_pred, labels=list(range(num_node_classes)))
+            if opt.print_val_node_cm_every > 0 and (epoch % opt.print_val_node_cm_every == 0):
+                val_node_cm_df = format_confusion_matrix_df(val_node_cm, node_class_names)
+                logger.info("=" * 100)
+                logger.info("VAL Node Confusion Matrix @ epoch %d", epoch)
+                logger.info("\n%s", val_node_cm_df.to_string())
+                logger.info("=" * 100)
+            if opt.save_val_node_cm:
+                save_confusion_matrix_artifacts(
+                    val_node_cm,
+                    node_class_names,
+                    Path(val_node_cm_dir) / f"epoch_{epoch:03d}_val_node_cm"
+                )
 
         common_state = {
             "epoch": epoch,
@@ -976,9 +1041,11 @@ def main():
             "scheduler": scheduler.state_dict() if scheduler is not None else None,
             "scaler": scaler.state_dict() if scaler is not None else None,
             "best_val_selection": best_val_selection,
-            "best_val_graph_macro_f1": best_val_graph_macro_f1,
-            "best_val_node_macro_f1": best_val_node_macro_f1,
             "best_test_selection": best_test_selection,
+            "best_val_graph_macro_f1": best_val_graph_macro_f1,
+            "best_test_graph_macro_f1": best_test_graph_macro_f1,
+            "best_val_node_macro_f1": best_val_node_macro_f1,
+            "best_test_node_macro_f1": best_test_node_macro_f1,
             "history": history,
             "label_mapping": label_mapping,
             "node_label_mapping": node_label_mapping,
@@ -989,40 +1056,112 @@ def main():
         last_ckpt_path = os.path.join(opt.save_folder, f"{opt.model_name}_last.pth")
         save_checkpoint(common_state, last_ckpt_path)
 
-        # save every epoch
-        epoch_ckpt_path = os.path.join(epoch_save_dir, f"{opt.model_name}_epoch_{epoch:03d}.pth")
-        save_checkpoint(common_state, epoch_ckpt_path)
+        # optional save every epoch
+        if opt.save_epoch_checkpoints and (epoch % max(1, opt.epoch_save_every) == 0):
+            epoch_ckpt_path = os.path.join(epoch_save_dir, f"{opt.model_name}_epoch_{epoch:03d}.pth")
+            save_checkpoint(common_state, epoch_ckpt_path)
 
         # best by selection metric
         if val_select > best_val_selection:
             best_val_selection = val_select
-            best_val_graph_macro_f1 = val_metrics["graph"]["macro_f1"]
-            best_val_node_macro_f1 = val_metrics["node"]["macro_f1"]
-
-            best_path = os.path.join(opt.save_folder, f"{opt.model_name}_best_joint.pth")
             state = {
                 **common_state,
                 "best_val_selection": best_val_selection,
+                "best_test_selection": best_test_selection,
                 "best_val_graph_macro_f1": best_val_graph_macro_f1,
+                "best_test_graph_macro_f1": best_test_graph_macro_f1,
                 "best_val_node_macro_f1": best_val_node_macro_f1,
+                "best_test_node_macro_f1": best_test_node_macro_f1,
             }
+            best_path = os.path.join(opt.save_folder, f"{opt.model_name}_best_joint.pth")
+            save_checkpoint(state, best_path)
+            logger.info(f"🔥 New best VAL {opt.selection_metric}: {best_val_selection:.4f} | saved to {best_path}")
+
+        # best by val graph macro-F1
+        if val_metrics["graph"]["macro_f1"] > best_val_graph_macro_f1:
+            best_val_graph_macro_f1 = val_metrics["graph"]["macro_f1"]
+            state = {
+                **common_state,
+                "best_val_selection": best_val_selection,
+                "best_test_selection": best_test_selection,
+                "best_val_graph_macro_f1": best_val_graph_macro_f1,
+                "best_test_graph_macro_f1": best_test_graph_macro_f1,
+                "best_val_node_macro_f1": best_val_node_macro_f1,
+                "best_test_node_macro_f1": best_test_node_macro_f1,
+            }
+            best_path = os.path.join(opt.save_folder, f"{opt.model_name}_best_val_graph.pth")
             save_checkpoint(state, best_path)
             np.save(os.path.join(opt.save_folder, "best_val_graph_confusion_matrix.npy"), val_graph_cm)
-            logger.info(
-                f"🔥 New best val {opt.selection_metric}: {best_val_selection:.4f} | saved to {best_path}"
-            )
+            save_confusion_matrix_artifacts(val_graph_cm, graph_class_names, Path(opt.save_folder) / "best_val_graph_confusion_matrix")
+            logger.info(f"📈 New best VAL graph macro-F1: {best_val_graph_macro_f1:.4f} | saved to {best_path}")
+
+        # best by test graph macro-F1 (tracking only)
+        if test_metrics["graph"]["macro_f1"] > best_test_graph_macro_f1:
+            best_test_graph_macro_f1 = test_metrics["graph"]["macro_f1"]
+            state = {
+                **common_state,
+                "best_val_selection": best_val_selection,
+                "best_test_selection": best_test_selection,
+                "best_val_graph_macro_f1": best_val_graph_macro_f1,
+                "best_test_graph_macro_f1": best_test_graph_macro_f1,
+                "best_val_node_macro_f1": best_val_node_macro_f1,
+                "best_test_node_macro_f1": best_test_node_macro_f1,
+            }
+            best_path = os.path.join(opt.save_folder, f"{opt.model_name}_best_test_graph.pth")
+            save_checkpoint(state, best_path)
+            logger.info(f"🧪 New best TEST graph macro-F1: {best_test_graph_macro_f1:.4f} | saved to {best_path}")
+
+        # best by val node macro-F1
+        if opt.enable_node_task and val_metrics["node"]["macro_f1"] > best_val_node_macro_f1:
+            best_val_node_macro_f1 = val_metrics["node"]["macro_f1"]
+            state = {
+                **common_state,
+                "best_val_selection": best_val_selection,
+                "best_test_selection": best_test_selection,
+                "best_val_graph_macro_f1": best_val_graph_macro_f1,
+                "best_test_graph_macro_f1": best_test_graph_macro_f1,
+                "best_val_node_macro_f1": best_val_node_macro_f1,
+                "best_test_node_macro_f1": best_test_node_macro_f1,
+            }
+            best_path = os.path.join(opt.save_folder, f"{opt.model_name}_best_val_node.pth")
+            save_checkpoint(state, best_path)
+            if opt.enable_node_task and len(node_val_true) > 0:
+                save_confusion_matrix_artifacts(
+                    confusion_matrix(node_val_true, node_val_pred, labels=list(range(num_node_classes))),
+                    node_class_names,
+                    Path(opt.save_folder) / "best_val_node_confusion_matrix"
+                )
+            logger.info(f"📍 New best VAL node macro-F1: {best_val_node_macro_f1:.4f} | saved to {best_path}")
+
+        # best by test node macro-F1 (tracking only)
+        if opt.enable_node_task and test_metrics["node"]["macro_f1"] > best_test_node_macro_f1:
+            best_test_node_macro_f1 = test_metrics["node"]["macro_f1"]
+            state = {
+                **common_state,
+                "best_val_selection": best_val_selection,
+                "best_test_selection": best_test_selection,
+                "best_val_graph_macro_f1": best_val_graph_macro_f1,
+                "best_test_graph_macro_f1": best_test_graph_macro_f1,
+                "best_val_node_macro_f1": best_val_node_macro_f1,
+                "best_test_node_macro_f1": best_test_node_macro_f1,
+            }
+            best_path = os.path.join(opt.save_folder, f"{opt.model_name}_best_test_node.pth")
+            save_checkpoint(state, best_path)
+            logger.info(f"🧪 New best TEST node macro-F1: {best_test_node_macro_f1:.4f} | saved to {best_path}")
 
         # best by test selection (tracking only)
         if test_select > best_test_selection:
             best_test_selection = test_select
-            best_test_path = os.path.join(opt.save_folder, f"{opt.model_name}_best_test_joint.pth")
             state = {
                 **common_state,
                 "best_val_selection": best_val_selection,
-                "best_val_graph_macro_f1": best_val_graph_macro_f1,
-                "best_val_node_macro_f1": best_val_node_macro_f1,
                 "best_test_selection": best_test_selection,
+                "best_val_graph_macro_f1": best_val_graph_macro_f1,
+                "best_test_graph_macro_f1": best_test_graph_macro_f1,
+                "best_val_node_macro_f1": best_val_node_macro_f1,
+                "best_test_node_macro_f1": best_test_node_macro_f1,
             }
+            best_test_path = os.path.join(opt.save_folder, f"{opt.model_name}_best_test_joint.pth")
             save_checkpoint(state, best_test_path)
             logger.info(f"🧪 New best TEST {opt.selection_metric}: {best_test_selection:.4f} | saved to {best_test_path}")
 
@@ -1051,37 +1190,44 @@ def main():
         f"Node acc={test_metrics['node']['acc']*100:.2f}% | Node macro_f1={test_metrics['node']['macro_f1']:.4f} | "
         f"selection={selection_score(test_metrics, opt.selection_metric):.4f}"
     )
-    logger.info(f"Final Test Graph Confusion Matrix:\n{test_graph_cm}")
+    test_graph_cm_df = format_confusion_matrix_df(test_graph_cm, graph_class_names)
+    logger.info("Final Test Graph Confusion Matrix:\n%s", test_graph_cm_df.to_string())
 
     graph_report = classification_report(
         y_test_true,
         y_test_pred,
         labels=list(range(num_graph_classes)),
-        target_names=label_names,
+        target_names=graph_class_names,
         digits=4,
         zero_division=0,
     )
     logger.info(f"\nFinal GRAPH Classification Report:\n{graph_report}")
 
     np.save(os.path.join(opt.save_folder, "final_graph_confusion_matrix.npy"), test_graph_cm)
+    save_confusion_matrix_artifacts(test_graph_cm, graph_class_names, Path(final_reports_dir) / "final_graph_confusion_matrix")
     with open(os.path.join(opt.save_folder, "final_graph_classification_report.txt"), "w", encoding="utf-8") as f:
+        f.write(graph_report)
+    with open(os.path.join(final_reports_dir, "final_graph_classification_report.txt"), "w", encoding="utf-8") as f:
         f.write(graph_report)
 
     if opt.enable_node_task and len(node_test_true) > 0:
         test_node_cm = confusion_matrix(node_test_true, node_test_pred, labels=list(range(num_node_classes)))
-        node_target_names = [node_label_mapping[i] for i in range(num_node_classes)]
         node_report = classification_report(
             node_test_true,
             node_test_pred,
             labels=list(range(num_node_classes)),
-            target_names=node_target_names,
+            target_names=node_class_names,
             digits=4,
             zero_division=0,
         )
-        logger.info(f"Final Test Node Confusion Matrix:\n{test_node_cm}")
+        test_node_cm_df = format_confusion_matrix_df(test_node_cm, node_class_names)
+        logger.info("Final Test Node Confusion Matrix:\n%s", test_node_cm_df.to_string())
         logger.info(f"\nFinal NODE Classification Report:\n{node_report}")
         np.save(os.path.join(opt.save_folder, "final_node_confusion_matrix.npy"), test_node_cm)
+        save_confusion_matrix_artifacts(test_node_cm, node_class_names, Path(final_reports_dir) / "final_node_confusion_matrix")
         with open(os.path.join(opt.save_folder, "final_node_classification_report.txt"), "w", encoding="utf-8") as f:
+            f.write(node_report)
+        with open(os.path.join(final_reports_dir, "final_node_classification_report.txt"), "w", encoding="utf-8") as f:
             f.write(node_report)
 
     logger.info("\nTraining finished.")

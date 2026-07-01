@@ -21,7 +21,7 @@ class FocalLoss(nn.Module):
             return focal_loss.sum()
 
 class PolyFocalLoss(nn.Module):
-    def __init__(self, num_classes, alpha=None, gamma=2.0, epsilon=1.0, label_smoothing=0.1, reduction='mean'):
+    def __init__(self, num_classes=10, alpha=None, gamma=2.0, epsilon=1.0, label_smoothing=0.1, reduction='mean'):
         """
         Args:
             alpha: Class weights (Tensor).

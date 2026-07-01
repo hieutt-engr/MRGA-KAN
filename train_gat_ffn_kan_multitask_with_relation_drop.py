@@ -43,6 +43,14 @@ except Exception:
 from networks.graph_attention_ffn_kan_multitask_updated import GraphAttentionKAN
 from utils import get_class_names, format_confusion_matrix_df, save_confusion_matrix_artifacts
 
+RELATION_NAME_TO_ID = {
+    "temporal": 0,
+    "same_id": 1,
+    "payload_sim": 2,
+    "timing_aff": 3,
+}
+RELATION_ID_TO_NAME = {v: k for k, v in RELATION_NAME_TO_ID.items()}
+
 
 # ============================================================
 # CLI
@@ -73,14 +81,18 @@ def parse_option():
     parser.add_argument("--weight_decay", type=float, default=0.0001)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--print_freq", type=int, default=50)
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="Training device. Use 'cpu', 'cuda', or explicit 'cuda:N'.")
+    parser.add_argument("--gpu_id", type=int, default=0,
+                        help="GPU index used when --device cuda is selected.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--resume", type=str, default="", help="Path to checkpoint to resume")
-    parser.add_argument("--print_val_node_cm_every", type=int, default=0,
+    parser.add_argument("--print_val_node_cm_every", type=int, default=1,
                         help="Print val node confusion matrix every N epochs (0 to disable).")
     parser.add_argument("--save_val_node_cm", action="store_true",
                         help="Save val node confusion matrix per epoch to CSV/TXT.")
+
 
     # Scheduler
     parser.add_argument("--scheduler", type=str, default="cosine_restart",
@@ -139,6 +151,9 @@ def parse_option():
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--ffn_ratio", type=float, default=2.0)
     parser.add_argument("--num_relations", type=int, default=4)
+    parser.add_argument("--drop_relation", type=str, default="none",
+                        help="Drop a relation from all splits during training/evaluation. "
+                             "Options: none, temporal, same_id, payload_sim, timing_aff, or an integer relation id.")
 
     # Block KAN config (for FFN in MultiRelationGATBlock)
     parser.add_argument("--block_kan_grid_size", type=int, default=5)
@@ -156,6 +171,14 @@ def parse_option():
     parser.add_argument("--kan_scale_spline", type=float, default=1.0)
 
     opt = parser.parse_args()
+
+    opt.drop_relation_id = parse_drop_relation_arg(opt.drop_relation)
+    if opt.drop_relation_id is not None and not (0 <= opt.drop_relation_id < opt.num_relations):
+        raise ValueError(
+            f"--drop_relation resolved to relation id {opt.drop_relation_id}, "
+            f"but --num_relations={opt.num_relations}."
+        )
+    opt.drop_relation_name = RELATION_ID_TO_NAME.get(opt.drop_relation_id, "none")
 
     os.makedirs(opt.save_folder, exist_ok=True)
     if opt.save_epoch_checkpoints:
@@ -195,6 +218,61 @@ def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def parse_drop_relation_arg(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if raw == "":
+        return None
+    norm = raw.lower().replace("-", "_").replace(" ", "_")
+    if norm in {"none", "null", "no", "false", "off"}:
+        return None
+    if norm in RELATION_NAME_TO_ID:
+        return RELATION_NAME_TO_ID[norm]
+    if norm.isdigit() or (norm.startswith("-") and norm[1:].isdigit()):
+        return int(norm)
+    raise ValueError(
+        "--drop_relation must be one of: none, temporal, same_id, payload_sim, timing_aff, "
+        f"or an integer id. Got: {value}"
+    )
+
+
+def apply_relation_ablation(data: Data, drop_relation_id: Optional[int]) -> Data:
+    if drop_relation_id is None or not hasattr(data, "edge_type"):
+        return data
+
+    edge_type = data.edge_type.view(-1)
+    keep_mask = edge_type != int(drop_relation_id)
+
+    if bool(keep_mask.all()):
+        return data
+
+    data.edge_index = data.edge_index[:, keep_mask]
+    data.edge_type = edge_type[keep_mask]
+
+    if hasattr(data, "edge_attr") and data.edge_attr is not None:
+        if data.edge_attr.size(0) == keep_mask.numel():
+            data.edge_attr = data.edge_attr[keep_mask]
+
+    return data
+
+
+def cm_df_to_aligned_string(cm_df: pd.DataFrame, index_label: str = "true\pred", min_col_width: int = 12) -> str:
+    """Render a confusion matrix DataFrame with evenly spaced columns for clean terminal logs."""
+    values = cm_df.values
+    value_width = max(len(str(int(v))) for v in values.flatten()) if values.size > 0 else 1
+    label_width = max([len(str(c)) for c in cm_df.columns] + [len(str(i)) for i in cm_df.index] + [len(index_label)])
+    cell_w = max(min_col_width, value_width + 2, label_width + 2)
+    row_label_w = max(len(index_label), max(len(str(i)) for i in cm_df.index)) + 2
+
+    header = " " * row_label_w + "".join(f"{str(col):^{cell_w}}" for col in cm_df.columns)
+    lines = [header]
+    for idx, row in cm_df.iterrows():
+        row_str = f"{str(idx):<{row_label_w}}" + "".join(f"{int(v):^{cell_w}d}" for v in row.values)
+        lines.append(row_str)
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -358,7 +436,7 @@ def build_criterion(loss_name: str, label_smoothing: float, focal_gamma: float,
             return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
         logger.info(f"Using {prefix}PolyFocalLoss")
         try:
-            return PolyFocalLoss(gamma=focal_gamma)
+            return PolyFocalLoss(gamma=focal_gamma, num_classes=10)
         except TypeError:
             return PolyFocalLoss()
 
@@ -517,6 +595,8 @@ def train_one_epoch(
         data.edge_type = data.edge_type.long()
         if hasattr(data, "id_token"):
             data.id_token = data.id_token.long()
+        data = apply_relation_ablation(data, opt.drop_relation_id)
+        data = apply_relation_ablation(data, opt.drop_relation_id)
         y = data.y.view(-1).long()
         node_y, node_mask = get_node_targets_and_mask(data, node_target=opt.node_target)
 
@@ -715,13 +795,28 @@ def main():
     logger.info(f"Options:\n{json.dumps(vars(opt), indent=2)}")
     logger.info("=" * 80)
 
+    if opt.drop_relation_id is None:
+        logger.info("Relation ablation: none (all relations are used)")
+    else:
+        logger.info(
+            f"Relation ablation enabled: dropping relation '{opt.drop_relation_name}' "
+            f"(id={opt.drop_relation_id}) from train/val/test graphs"
+        )
+
     set_seed(opt.seed)
 
-    if torch.cuda.is_available() and opt.device != "cpu":
-        logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
-    else:
+    requested_device = str(opt.device).lower().strip()
+    if requested_device == "cpu" or not torch.cuda.is_available():
         opt.device = "cpu"
         logger.info("Using CPU")
+    else:
+        if requested_device == "cuda":
+            opt.device = f"cuda:{opt.gpu_id}"
+        else:
+            # explicit device string like cuda:2 takes precedence
+            opt.device = str(opt.device)
+        gpu_index = int(str(opt.device).split(":")[1]) if ":" in str(opt.device) else 0
+        logger.info(f"Using GPU {gpu_index}: {torch.cuda.get_device_name(gpu_index)}")
 
     graph_folder = Path(opt.graph_folder)
 

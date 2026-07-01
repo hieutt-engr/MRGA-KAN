@@ -40,7 +40,7 @@ except Exception:
 # ============================================================
 # Your model
 # ============================================================
-from networks.graph_attention_ffn_kan_multitask_updated import GraphAttentionKAN
+import importlib
 from utils import get_class_names, format_confusion_matrix_df, save_confusion_matrix_artifacts
 
 
@@ -49,7 +49,7 @@ from utils import get_class_names, format_confusion_matrix_df, save_confusion_ma
 # ============================================================
 
 def parse_option():
-    parser = argparse.ArgumentParser("Train multitask GraphAttentionKAN for IVN IDS")
+    parser = argparse.ArgumentParser("Train multitask graph-attention ablation models for IVN IDS")
 
     # Paths
     parser.add_argument("--graph_folder", type=str, required=True,
@@ -58,6 +58,11 @@ def parse_option():
                         help="Folder to save checkpoints and logs")
     parser.add_argument("--model_name", type=str, default="graph_attention_ffn_kan_multitask",
                         help="Base name for saved models")
+    parser.add_argument("--model_variant", type=str, default="mlpffn_kanhead",
+                        choices=["mlpffn_kanhead", "mlpffn_mlphead", "ffnkan_mlphead"],
+                        help="Baseline model variant to train for ablation study")
+    parser.add_argument("--model_module", type=str, default="",
+                        help="Optional explicit module path. If provided, overrides --model_variant")
 
     # Data loading
     parser.add_argument("--batch_size", type=int, default=64)
@@ -378,7 +383,7 @@ def build_criterion(loss_name: str, label_smoothing: float, focal_gamma: float,
             return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
         logger.info(f"Using {prefix}PolyFocalLoss")
         try:
-            return PolyFocalLoss(gamma=focal_gamma, num_classes=10)
+            return PolyFocalLoss(gamma=focal_gamma)
         except TypeError:
             return PolyFocalLoss()
 
@@ -715,6 +720,31 @@ def evaluate(model, loader, criterion_graph, criterion_node, opt):
 
 
 # ============================================================
+# Model selection
+# ============================================================
+
+def resolve_model_module(opt):
+    if getattr(opt, 'model_module', ''):
+        return opt.model_module
+    mapping = {
+        'mlpffn_kanhead': 'networks.graph_attention_mlpffn_kanhead_multitask',
+        'mlpffn_mlphead': 'networks.graph_attention_mlpffn_mlphead_multitask',
+        'ffnkan_mlphead': 'networks.graph_attention_ffn_kan_mlphead_multitask',
+    }
+    if opt.model_variant not in mapping:
+        raise ValueError(f'Unsupported model_variant: {opt.model_variant}')
+    return mapping[opt.model_variant]
+
+
+def import_graph_model(opt):
+    module_name = resolve_model_module(opt)
+    module = importlib.import_module(module_name)
+    if not hasattr(module, 'GraphAttentionKAN'):
+        raise ImportError(f'Module {module_name} does not define GraphAttentionKAN')
+    return module.GraphAttentionKAN, module_name
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -726,12 +756,14 @@ def main():
     epoch_save_dir = os.path.join(opt.save_folder, "epoch_save")
     val_node_cm_dir = os.path.join(opt.save_folder, "val_node_cm")
     final_reports_dir = os.path.join(opt.save_folder, "reports")
+    if opt.save_epoch_checkpoints:
+        os.makedirs(epoch_save_dir, exist_ok=True)
     if opt.save_val_node_cm:
         os.makedirs(val_node_cm_dir, exist_ok=True)
     os.makedirs(final_reports_dir, exist_ok=True)
 
     logger.info("=" * 80)
-    logger.info("Start training multitask GraphAttentionKAN with KAN-FFN backbone")
+    logger.info("Start training multitask baseline graph-attention model for ablation study")
     logger.info(f"Options:\n{json.dumps(vars(opt), indent=2)}")
     logger.info("=" * 80)
 
@@ -830,9 +862,10 @@ def main():
     # Model
     # ----------------------------
     logger.info("Initializing model...")
+    GraphAttentionKAN, model_module_name = import_graph_model(opt)
+    logger.info(f"Using model module: {model_module_name}")
+    logger.info(f"Using model variant: {opt.model_variant}")
 
-    # IMPORTANT: this script assumes the model was updated for multitask and
-    # accepts `num_node_classes` and returns both graph_logits and node_logits.
     try:
         model = GraphAttentionKAN(
             node_feat_dim=node_feat_dim,
@@ -863,8 +896,8 @@ def main():
         ).to(opt.device)
     except TypeError as e:
         raise RuntimeError(
-            "GraphAttentionKAN is not yet updated for multitask. Please add a node head and let forward() return "
-            "both graph_logits and node_logits. Also add __init__(..., num_node_classes=...)."
+            f"Selected model module {model_module_name} is not compatible with this multitask trainer. "
+            "It must define GraphAttentionKAN(..., num_node_classes=...) and return graph/node logits."
         ) from e
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1017,7 +1050,7 @@ def main():
 
         val_graph_cm = confusion_matrix(y_val_true, y_val_pred, labels=list(range(num_graph_classes)))
         val_graph_cm_df = format_confusion_matrix_df(val_graph_cm, graph_class_names)
-        logger.info("Val Graph Confusion Matrix:\n%s", val_graph_cm_df.to_string())
+        logger.info("Val Graph Confusion Matrix:\n%s", cm_df_to_aligned_string(val_graph_cm_df, index_label="true\\pred", min_col_width=12))
 
         if opt.enable_node_task and len(node_val_true) > 0:
             val_node_cm = confusion_matrix(node_val_true, node_val_pred, labels=list(range(num_node_classes)))
@@ -1025,7 +1058,7 @@ def main():
                 val_node_cm_df = format_confusion_matrix_df(val_node_cm, node_class_names)
                 logger.info("=" * 100)
                 logger.info("VAL Node Confusion Matrix @ epoch %d", epoch)
-                logger.info("\n%s", val_node_cm_df.to_string())
+                logger.info("\n%s", cm_df_to_aligned_string(val_node_cm_df, index_label="true\\pred", min_col_width=12))
                 logger.info("=" * 100)
             if opt.save_val_node_cm:
                 save_confusion_matrix_artifacts(
@@ -1056,10 +1089,13 @@ def main():
         last_ckpt_path = os.path.join(opt.save_folder, f"{opt.model_name}_last.pth")
         save_checkpoint(common_state, last_ckpt_path)
 
-        # optional save every epoch
-        if opt.save_epoch_checkpoints and (epoch % max(1, opt.epoch_save_every) == 0):
-            epoch_ckpt_path = os.path.join(epoch_save_dir, f"{opt.model_name}_epoch_{epoch:03d}.pth")
-            save_checkpoint(common_state, epoch_ckpt_path)
+        # optional save periodic epoch checkpoints
+        if opt.save_epoch_checkpoints:
+            save_every = max(1, int(opt.epoch_save_every))
+            if epoch % save_every == 0:
+                epoch_ckpt_path = os.path.join(epoch_save_dir, f"{opt.model_name}_epoch_{epoch:03d}.pth")
+                save_checkpoint(common_state, epoch_ckpt_path)
+                logger.info(f"💾 Saved epoch checkpoint: {epoch_ckpt_path}")
 
         # best by selection metric
         if val_select > best_val_selection:
@@ -1191,7 +1227,7 @@ def main():
         f"selection={selection_score(test_metrics, opt.selection_metric):.4f}"
     )
     test_graph_cm_df = format_confusion_matrix_df(test_graph_cm, graph_class_names)
-    logger.info("Final Test Graph Confusion Matrix:\n%s", test_graph_cm_df.to_string())
+    logger.info("Final Test Graph Confusion Matrix:\n%s", cm_df_to_aligned_string(test_graph_cm_df, index_label="true\\pred", min_col_width=12))
 
     graph_report = classification_report(
         y_test_true,
@@ -1205,10 +1241,6 @@ def main():
 
     np.save(os.path.join(opt.save_folder, "final_graph_confusion_matrix.npy"), test_graph_cm)
     save_confusion_matrix_artifacts(test_graph_cm, graph_class_names, Path(final_reports_dir) / "final_graph_confusion_matrix")
-    with open(os.path.join(opt.save_folder, "final_graph_classification_report.txt"), "w", encoding="utf-8") as f:
-        f.write(graph_report)
-    with open(os.path.join(final_reports_dir, "final_graph_classification_report.txt"), "w", encoding="utf-8") as f:
-        f.write(graph_report)
 
     if opt.enable_node_task and len(node_test_true) > 0:
         test_node_cm = confusion_matrix(node_test_true, node_test_pred, labels=list(range(num_node_classes)))
@@ -1221,20 +1253,17 @@ def main():
             zero_division=0,
         )
         test_node_cm_df = format_confusion_matrix_df(test_node_cm, node_class_names)
-        logger.info("Final Test Node Confusion Matrix:\n%s", test_node_cm_df.to_string())
+        logger.info("Final Test Node Confusion Matrix:\n%s", cm_df_to_aligned_string(test_node_cm_df, index_label="true\\pred", min_col_width=12))
         logger.info(f"\nFinal NODE Classification Report:\n{node_report}")
         np.save(os.path.join(opt.save_folder, "final_node_confusion_matrix.npy"), test_node_cm)
         save_confusion_matrix_artifacts(test_node_cm, node_class_names, Path(final_reports_dir) / "final_node_confusion_matrix")
-        with open(os.path.join(opt.save_folder, "final_node_classification_report.txt"), "w", encoding="utf-8") as f:
-            f.write(node_report)
-        with open(os.path.join(final_reports_dir, "final_node_classification_report.txt"), "w", encoding="utf-8") as f:
-            f.write(node_report)
 
     logger.info("\nTraining finished.")
     logger.info(f"Best val selection ({opt.selection_metric}): {best_val_selection:.4f}")
     logger.info(f"Best val graph macro-F1            : {best_val_graph_macro_f1:.4f}")
     logger.info(f"Best val node macro-F1             : {best_val_node_macro_f1:.4f}")
     logger.info(f"Best test selection ({opt.selection_metric}): {best_test_selection:.4f}")
+    logger.info("Checkpoint and confusion-matrix artifacts saved. No classification-report files were written.")
     logger.info(f"Artifacts saved in: {opt.save_folder}")
 
 
